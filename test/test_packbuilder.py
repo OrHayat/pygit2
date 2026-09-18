@@ -75,6 +75,7 @@ def test_pack_with_delegate(testrepo: Repository, tmp_path: Path) -> None:
     def pack_delegate(pb: PackBuilder) -> None:
         for branch in pb._repo.branches:
             br = pb._repo.branches.get(branch)
+            assert br is not None
             for commit in br.log():
                 pb.add_recur(commit.oid_new)
 

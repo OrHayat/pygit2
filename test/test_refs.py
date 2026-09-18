@@ -466,6 +466,26 @@ def test_lookup_reference(testrepo: Repository) -> None:
     assert reference.name == 'refs/heads/master'
 
 
+def test_references_get_invalid_name(testrepo: Repository) -> None:
+    """A name libgit2 rejects as a spec is still "not found" to get().
+
+    git_reference_lookup reports GIT_EINVALIDSPEC as well as GIT_ENOTFOUND,
+    and only the latter reaches pygit2 as a KeyError.
+    """
+    repo = testrepo
+
+    # 'master' is not a full reference name, so libgit2 calls it invalid.
+    assert repo.references.get('master') is None
+    assert 'master' not in repo.references
+
+    # A well-formed name that does not exist behaves the same way.
+    assert repo.references.get('refs/heads/does-not-exist') is None
+
+    # __getitem__ still raises, as documented.
+    with pytest.raises((KeyError, InvalidSpecError)):
+        repo.references['master']
+
+
 def test_lookup_reference_dwim(testrepo: Repository) -> None:
     repo = testrepo
 

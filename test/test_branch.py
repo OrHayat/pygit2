@@ -85,11 +85,13 @@ def test_branches_delete_error(testrepo: Repository) -> None:
 
 def test_branches_is_head(testrepo: Repository) -> None:
     branch = testrepo.branches.get('master')
+    assert branch is not None
     assert branch.is_head()
 
 
 def test_branches_is_not_head(testrepo: Repository) -> None:
     branch = testrepo.branches.get('i18n')
+    assert branch is not None
     assert not branch.is_head()
 
 
@@ -98,34 +100,40 @@ def test_branches_rename(testrepo: Repository) -> None:
     assert new_branch.target == I18N_LAST_COMMIT
 
     new_branch_2 = testrepo.branches.get('new-branch')
+    assert new_branch_2 is not None
     assert new_branch_2.target == I18N_LAST_COMMIT
 
 
 def test_branches_rename_error(testrepo: Repository) -> None:
     original_branch = testrepo.branches.get('i18n')
+    assert original_branch is not None
     with pytest.raises(ValueError):
         original_branch.rename('master')
 
 
 def test_branches_rename_force(testrepo: Repository) -> None:
     original_branch = testrepo.branches.get('master')
+    assert original_branch is not None
     new_branch = original_branch.rename('i18n', True)
     assert new_branch.target == LAST_COMMIT
 
 
 def test_branches_rename_invalid(testrepo: Repository) -> None:
     original_branch = testrepo.branches.get('i18n')
+    assert original_branch is not None
     with pytest.raises(ValueError):
         original_branch.rename('abc@{123')
 
 
 def test_branches_name(testrepo: Repository) -> None:
     branch = testrepo.branches.get('master')
+    assert branch is not None
     assert branch.branch_name == 'master'
     assert branch.name == 'refs/heads/master'
     assert branch.raw_branch_name == branch.branch_name.encode('utf-8')
 
     branch = testrepo.branches.get('i18n')
+    assert branch is not None
     assert branch.branch_name == 'i18n'
     assert branch.name == 'refs/heads/i18n'
     assert branch.raw_branch_name == branch.branch_name.encode('utf-8')
@@ -268,3 +276,16 @@ def test_branch_name(testrepo: Repository) -> None:
     branch = testrepo.lookup_branch('i18n')
     assert branch.branch_name == 'i18n'
     assert branch.name == 'refs/heads/i18n'
+
+
+def test_branches_get_invalid_name(testrepo: Repository) -> None:
+    """Branches.get() returns None for a name that is not a valid branch name.
+
+    git_branch_lookup reports GIT_EINVALIDSPEC for these, which arrives as
+    InvalidSpecError rather than KeyError.
+    """
+    repo = testrepo
+
+    assert repo.branches.get('my branch') is None
+    assert 'my branch' not in repo.branches
+    assert repo.branches.get('does-not-exist') is None

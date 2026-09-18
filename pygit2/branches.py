@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
-from ._pygit2 import Branch, Commit, Oid
+from ._pygit2 import Branch, Commit, InvalidSpecError, Oid
 from .enums import BranchType, ReferenceType
 
 # Need BaseRepository for type hints, but don't let it cause a circular dependency
@@ -72,11 +72,13 @@ class Branches:
 
         return branch
 
-    def get(self, key: str) -> Branch:
+    def get(self, key: str) -> Branch | None:
         try:
             return self[key]
-        except KeyError:
-            return None  # type:ignore #  next commit
+        except (KeyError, InvalidSpecError):
+            # As in References.get: git_branch_lookup reports
+            # GIT_EINVALIDSPEC for a name that is not a valid branch name.
+            return None
 
     def __iter__(self) -> Iterator[str]:
         for branch_name in self._repository.listall_branches(self._flag):

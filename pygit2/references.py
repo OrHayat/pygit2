@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 from pygit2 import Oid
 
+from ._pygit2 import InvalidSpecError
 from .enums import ReferenceFilter
 
 # Need BaseRepository for type hints, but don't let it cause a circular dependency
@@ -48,7 +49,10 @@ class References:
     def get(self, key: str) -> 'Reference' | None:
         try:
             return self[key]
-        except KeyError:
+        except (KeyError, InvalidSpecError):
+            # git_reference_lookup reports GIT_EINVALIDSPEC as well as
+            # GIT_ENOTFOUND for a name it cannot resolve; only the latter
+            # arrives as a KeyError.
             return None
 
     def __iter__(self) -> Iterator[str]:

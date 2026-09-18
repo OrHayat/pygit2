@@ -42,6 +42,7 @@ def repo(emptyrepo: Repository) -> Generator[Repository, None, None]:
 
 def test_branches_remote_get(repo: Repository) -> None:
     branch = repo.branches.remote.get('origin/master')
+    assert branch is not None
     assert branch.target == ORIGIN_MASTER_COMMIT
     assert repo.branches.remote.get('origin/not-exists') is None
 
