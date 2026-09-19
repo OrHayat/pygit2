@@ -334,3 +334,25 @@ def test_index_add(testrepo: Repository) -> None:
     subprocess.run(
         [sys.executable, '-c', INDEX_ADD_SCRIPT, testrepo.workdir], check=True
     )
+
+
+class WriteBackend(pygit2.OdbBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.written: list[tuple[Oid, bytes, int]] = []
+
+    def exists_cb(self, oid: Oid | str) -> bool:
+        return False
+
+    def refresh_cb(self) -> None:
+        pass
+
+    def write_cb(self, oid: Oid, data: bytes, typ: int) -> None:
+        self.written.append((oid, data, typ))
+
+
+def test_write_cb(testrepo: Repository) -> None:
+    backend = WriteBackend()
+    testrepo.odb.add_backend(backend, 100)
+    oid = testrepo.create_blob(b'hello')
+    assert backend.written == [(oid, b'hello', ObjectType.BLOB)]

@@ -189,7 +189,7 @@ pgit_odb_backend_write(git_odb_backend *_be, const git_oid *oid,
     if (py_oid == NULL)
         goto done;
 
-    result = PyObject_CallMethod(be->py_backend, "write_cb", "Ny#n", py_oid, data, sz, typ);
+    result = PyObject_CallMethod(be->py_backend, "write_cb", "Ny#i", py_oid, data, sz, (int)typ);
     if (result == NULL) {
         err = git_error_for_exc();
         goto done;
