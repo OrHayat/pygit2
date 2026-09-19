@@ -27,6 +27,8 @@
 
 # Standard Library
 import binascii
+import subprocess
+import sys
 from collections.abc import Generator, Iterator
 from pathlib import Path
 
@@ -277,3 +279,58 @@ def test_foreach_cb_bad_oid(barerepo: Repository) -> None:
     odb.add_backend(backend, 1)
     with pytest.raises(pygit2.InvalidError):
         next(iter(odb))
+
+
+#
+# Test a custom object backend called back from a cffi function.
+#
+
+INDEX_ADD_SCRIPT = """
+import sys
+import pygit2
+from pygit2.enums import ObjectType
+
+
+class MemoryBackend(pygit2.OdbBackend):
+    def __init__(self):
+        super().__init__()
+        self.objects = {}
+
+    def read_cb(self, oid):
+        return ObjectType.BLOB, self.objects[oid]
+
+    def read_prefix_cb(self, prefix):
+        raise KeyError(prefix)
+
+    def read_header_cb(self, oid):
+        return ObjectType.BLOB, len(self.objects[oid])
+
+    def exists_cb(self, oid):
+        return oid in self.objects
+
+    def exists_prefix_cb(self, prefix):
+        raise KeyError(prefix)
+
+    def refresh_cb(self):
+        pass
+
+    def write_cb(self, oid, data, typ):
+        self.objects[oid] = data
+
+
+repo = pygit2.Repository(sys.argv[1])
+backend = MemoryBackend()
+repo.odb.add_backend(backend, 100)
+repo.index.add('hello.txt')
+assert backend.objects[repo.index['hello.txt'].id] == b'hello'
+"""
+
+
+def test_index_add(testrepo: Repository) -> None:
+    # Index.add calls libgit2 through cffi, which releases the GIL: the backend
+    # callbacks must acquire it. Without the GIL the interpreter crashes, so
+    # run in a subprocess.
+    (Path(testrepo.workdir) / 'hello.txt').write_bytes(b'hello')
+    subprocess.run(
+        [sys.executable, '-c', INDEX_ADD_SCRIPT, testrepo.workdir], check=True
+    )

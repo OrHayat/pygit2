@@ -56,39 +56,50 @@ typedef struct {
     PyObject *py_backend;
 } pgit_odb_backend;
 
+/*
+ * The callbacks below may be called by libgit2 without the GIL: cffi releases
+ * it around every C call, and functions such as git_index_add_bypath end up
+ * here. So they must acquire it before calling into Python.
+ */
+
 static int
 pgit_odb_backend_read(void **ptr, size_t *sz, git_object_t *type,
                       git_odb_backend *_be, const git_oid *oid)
 {
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    PyObject *result = NULL;
+    int err = GIT_EUSER;
+    PyGILState_STATE gil = PyGILState_Ensure();
 
     PyObject *py_oid = git_oid_to_python(oid);
     if (py_oid == NULL)
-        return GIT_EUSER;
+        goto done;
 
-    PyObject *result = PyObject_CallMethod(be->py_backend, "read_cb", "N", py_oid);
-    if (result == NULL)
-        return git_error_for_exc();
+    result = PyObject_CallMethod(be->py_backend, "read_cb", "N", py_oid);
+    if (result == NULL) {
+        err = git_error_for_exc();
+        goto done;
+    }
 
     const char *bytes;
     Py_ssize_t type_value;
     Py_ssize_t py_sz;
-    if (!PyArg_ParseTuple(result, "ny#", &type_value, &bytes, &py_sz) || !bytes) {
-        Py_DECREF(result);
-        return GIT_EUSER;
-    }
+    if (!PyArg_ParseTuple(result, "ny#", &type_value, &bytes, &py_sz) || !bytes)
+        goto done;
     *type = (git_object_t)type_value;
     *sz = (size_t)py_sz;
 
     *ptr = git_odb_backend_data_alloc(_be, *sz);
-    if (!*ptr) {
-        Py_DECREF(result);
-        return GIT_EUSER;
-    }
+    if (!*ptr)
+        goto done;
 
     memcpy(*ptr, bytes, *sz);
-    Py_DECREF(result);
-    return 0;
+    err = 0;
+
+done:
+    Py_XDECREF(result);
+    PyGILState_Release(gil);
+    return err;
 }
 
 static int
@@ -101,34 +112,37 @@ pgit_odb_backend_read_prefix(git_oid *oid_out, void **ptr, size_t *sz, git_objec
 
     // Call callback
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    int err = GIT_EUSER;
+    PyGILState_STATE gil = PyGILState_Ensure();
     PyObject *result = PyObject_CallMethod(be->py_backend, "read_prefix_cb", "s#", short_id_hex, len);
-    if (result == NULL)
-        return git_error_for_exc();
+    if (result == NULL) {
+        err = git_error_for_exc();
+        goto done;
+    }
 
     // Parse output from callback
     PyObject *py_oid_out;
     Py_ssize_t type_value;
     Py_ssize_t py_sz;
     const char *bytes;
-    if (!PyArg_ParseTuple(result, "ny#O", &type_value, &bytes, &py_sz, &py_oid_out) || !bytes) {
-        Py_DECREF(result);
-        return GIT_EUSER;
-    }
+    if (!PyArg_ParseTuple(result, "ny#O", &type_value, &bytes, &py_sz, &py_oid_out) || !bytes)
+        goto done;
     *type = (git_object_t)type_value;
     *sz = (size_t)py_sz;
 
     *ptr = git_odb_backend_data_alloc(_be, *sz);
-    if (!*ptr) {
-        Py_DECREF(result);
-        return GIT_EUSER;
-    }
+    if (!*ptr)
+        goto done;
 
     memcpy(*ptr, bytes, *sz);
-    size_t oid_len = py_oid_to_git_oid(py_oid_out, oid_out);
-    Py_DECREF(result);
-    if (oid_len == 0)
-        return GIT_EUSER;
-    return 0;
+    if (py_oid_to_git_oid(py_oid_out, oid_out) == 0)
+        goto done;
+    err = 0;
+
+done:
+    Py_XDECREF(result);
+    PyGILState_Release(gil);
+    return err;
 }
 
 static int
@@ -136,24 +150,30 @@ pgit_odb_backend_read_header(size_t *len, git_object_t *type,
                              git_odb_backend *_be, const git_oid *oid)
 {
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    PyObject *result = NULL;
+    int err = GIT_EUSER;
+    PyGILState_STATE gil = PyGILState_Ensure();
 
     PyObject *py_oid = git_oid_to_python(oid);
     if (py_oid == NULL)
-        return GIT_EUSER;
+        goto done;
 
-    PyObject *result = PyObject_CallMethod(be->py_backend, "read_header_cb", "N", py_oid);
-    if (result == NULL)
-        return git_error_for_exc();
+    result = PyObject_CallMethod(be->py_backend, "read_header_cb", "N", py_oid);
+    if (result == NULL) {
+        err = git_error_for_exc();
+        goto done;
+    }
 
     Py_ssize_t type_value;
-    if (!PyArg_ParseTuple(result, "nn", &type_value, len)) {
-        Py_DECREF(result);
-        return GIT_EUSER;
-    }
+    if (!PyArg_ParseTuple(result, "nn", &type_value, len))
+        goto done;
     *type = (git_object_t)type_value;
+    err = 0;
 
-    Py_DECREF(result);
-    return 0;
+done:
+    Py_XDECREF(result);
+    PyGILState_Release(gil);
+    return err;
 }
 
 static int
@@ -161,34 +181,50 @@ pgit_odb_backend_write(git_odb_backend *_be, const git_oid *oid,
         const void *data, size_t sz, git_object_t typ)
 {
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    PyObject *result = NULL;
+    int err = GIT_EUSER;
+    PyGILState_STATE gil = PyGILState_Ensure();
 
     PyObject *py_oid = git_oid_to_python(oid);
     if (py_oid == NULL)
-        return GIT_EUSER;
+        goto done;
 
-    PyObject *result = PyObject_CallMethod(be->py_backend, "write_cb", "Ny#n", py_oid, data, sz, typ);
-    if (result == NULL)
-        return git_error_for_exc();
+    result = PyObject_CallMethod(be->py_backend, "write_cb", "Ny#n", py_oid, data, sz, typ);
+    if (result == NULL) {
+        err = git_error_for_exc();
+        goto done;
+    }
+    err = 0;
 
-    Py_DECREF(result);
-    return 0;
+done:
+    Py_XDECREF(result);
+    PyGILState_Release(gil);
+    return err;
 }
 
 static int
 pgit_odb_backend_exists(git_odb_backend *_be, const git_oid *oid)
 {
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    PyObject *result = NULL;
+    int r = GIT_EUSER;
+    PyGILState_STATE gil = PyGILState_Ensure();
 
     PyObject *py_oid = git_oid_to_python(oid);
     if (py_oid == NULL)
-        return GIT_EUSER;
+        goto done;
 
-    PyObject *result = PyObject_CallMethod(be->py_backend, "exists_cb", "N", py_oid);
-    if (result == NULL)
-        return git_error_for_exc();
+    result = PyObject_CallMethod(be->py_backend, "exists_cb", "N", py_oid);
+    if (result == NULL) {
+        r = git_error_for_exc();
+        goto done;
+    }
 
-    int r = PyObject_IsTrue(result);
-    Py_DECREF(result);
+    r = PyObject_IsTrue(result);
+
+done:
+    Py_XDECREF(result);
+    PyGILState_Release(gil);
     return r;
 }
 
@@ -202,23 +238,33 @@ pgit_odb_backend_exists_prefix(git_oid *out, git_odb_backend *_be,
 
     // Call callback
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    int err = GIT_EUSER;
+    PyGILState_STATE gil = PyGILState_Ensure();
     PyObject *py_oid = PyObject_CallMethod(be->py_backend, "exists_prefix_cb", "s#", short_id_hex, len);
-    if (py_oid == NULL)
-        return git_error_for_exc();
+    if (py_oid == NULL) {
+        err = git_error_for_exc();
+        goto done;
+    }
 
-    size_t oid_len = py_oid_to_git_oid(py_oid, out);
-    Py_DECREF(py_oid);
-    if (oid_len == 0)
-        return GIT_EUSER;
-    return 0;
+    if (py_oid_to_git_oid(py_oid, out) == 0)
+        goto done;
+    err = 0;
+
+done:
+    Py_XDECREF(py_oid);
+    PyGILState_Release(gil);
+    return err;
 }
 
 static int
 pgit_odb_backend_refresh(git_odb_backend *_be)
 {
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    PyGILState_STATE gil = PyGILState_Ensure();
     PyObject_CallMethod(be->py_backend, "refresh_cb", NULL);
-    return git_error_for_exc();
+    int err = git_error_for_exc();
+    PyGILState_Release(gil);
+    return err;
 }
 
 static int
@@ -226,43 +272,52 @@ pgit_odb_backend_foreach(git_odb_backend *_be,
         git_odb_foreach_cb cb, void *payload)
 {
     PyObject *item;
+    PyObject *iterator = NULL;
     git_oid oid;
     pgit_odb_backend *be = (pgit_odb_backend *)_be;
+    int err = GIT_EUSER;
+    PyGILState_STATE gil = PyGILState_Ensure();
 
     /* Call the Python __iter__ method directly. PyObject_GetIter would invoke
      * the C tp_iter slot (OdbBackend_as_iter), which calls this function back
      * and causes infinite recursion for Python backends. */
     PyObject *iter_method = PyObject_GetAttrString((PyObject *)be->py_backend, "__iter__");
-    if (iter_method == NULL)
-        return git_error_for_exc();
+    if (iter_method == NULL) {
+        err = git_error_for_exc();
+        goto done;
+    }
 
-    PyObject *iterator = PyObject_CallObject(iter_method, NULL);
+    iterator = PyObject_CallObject(iter_method, NULL);
     Py_DECREF(iter_method);
-    if (iterator == NULL)
-        return git_error_for_exc();
+    if (iterator == NULL) {
+        err = git_error_for_exc();
+        goto done;
+    }
 
     while ((item = PyIter_Next(iterator))) {
         size_t len = py_oid_to_git_oid(item, &oid);
         Py_DECREF(item);
-        if (len == 0) {
-            Py_DECREF(iterator);
-            return GIT_EUSER;
-        }
-        if (cb(&oid, payload) != 0) {
-            Py_DECREF(iterator);
-            return GIT_EUSER;
-        }
+        if (len == 0)
+            goto done;
+        if (cb(&oid, payload) != 0)
+            goto done;
     }
 
-    Py_DECREF(iterator);
-    return git_error_for_exc();
+    err = git_error_for_exc();
+
+done:
+    Py_XDECREF(iterator);
+    PyGILState_Release(gil);
+    return err;
 }
 
 static void
 pgit_odb_backend_free(git_odb_backend *backend)
 {
     pgit_odb_backend *custom_backend = (pgit_odb_backend *)backend;
+    PyGILState_STATE gil = PyGILState_Ensure();
     Py_DECREF(custom_backend->py_backend);
+    PyGILState_Release(gil);
 }
 
 int
