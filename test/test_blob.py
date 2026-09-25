@@ -26,9 +26,9 @@
 """Tests for Blob objects."""
 
 import io
+import threading
+from collections.abc import Callable
 from pathlib import Path
-from queue import Queue
-from threading import Event
 
 import pytest
 
@@ -219,35 +219,87 @@ def test_blob_from_repo(testrepo: Repository) -> None:
     assert patch_one.text == patch_two.text
 
 
-def test_blob_write_to_queue(testrepo: Repository) -> None:
-    queue: Queue[bytes] = Queue()
-    ready = Event()
-    done = Event()
+def read_ring(ring: pygit2._pygit2._BlobRing) -> bytes:
+    chunks = []
+    buf = bytearray(64 * 1024)
+    while n := ring.readinto(buf):
+        chunks.append(bytes(buf[:n]))
+    return b''.join(chunks)
+
+
+def test_blob_write_to_ring(testrepo: Repository) -> None:
+    ring = pygit2._pygit2._BlobRing(4, 128 * 1024)
     blob = testrepo[BLOB_SHA]
     assert isinstance(blob, pygit2.Blob)
-    blob._write_to_queue(queue, ready, done)
-    assert ready.wait()
-    assert done.wait()
-    chunks = []
-    while not queue.empty():
-        chunks.append(queue.get())
-    assert BLOB_CONTENT == b''.join(chunks)
+    blob._write_to_ring(ring)
+    assert BLOB_CONTENT == read_ring(ring)
 
 
-def test_blob_write_to_queue_filtered(testrepo: Repository) -> None:
-    queue: Queue[bytes] = Queue()
-    ready = Event()
-    done = Event()
+def test_blob_write_to_ring_filtered(testrepo: Repository) -> None:
+    ring = pygit2._pygit2._BlobRing(4, 128 * 1024)
     blob_oid = testrepo.create_blob_fromworkdir('bye.txt')
     blob = testrepo[blob_oid]
     assert isinstance(blob, pygit2.Blob)
-    blob._write_to_queue(queue, ready, done, as_path='bye.txt')
-    assert ready.wait()
-    assert done.wait()
-    chunks = []
-    while not queue.empty():
-        chunks.append(queue.get())
-    assert b'bye world\n' == b''.join(chunks)
+    blob._write_to_ring(ring, as_path='bye.txt')
+    assert b'bye world\n' == read_ring(ring)
+
+
+def test_blob_write_to_ring_small_slot(testrepo: Repository) -> None:
+    # Output larger than a slot spans several slots
+    ring = pygit2._pygit2._BlobRing(4, 16)
+    data = bytes(range(256)) * 4
+    blob = testrepo[testrepo.create_blob(data)]
+    assert isinstance(blob, pygit2.Blob)
+    thread = threading.Thread(target=blob._write_to_ring, args=(ring,))
+    thread.start()
+    assert data == read_ring(ring)
+    thread.join()
+
+
+def test_blob_write_to_ring_lazy_allocation(testrepo: Repository) -> None:
+    # The first slot is sized from the blob, so small blobs use little memory
+    ring = pygit2._pygit2._BlobRing(4, 128 * 1024)
+    assert ring.allocated() == 0
+    blob = testrepo[BLOB_SHA]
+    assert isinstance(blob, pygit2.Blob)
+    blob._write_to_ring(ring)
+    assert 0 < ring.allocated() <= 4096
+    assert BLOB_CONTENT == read_ring(ring)
+
+
+def test_blob_write_to_ring_invalid_commit_id_type(testrepo: Repository) -> None:
+    # Regression test (issue #1478): an invalid commit_id type must raise
+    # TypeError instead of being ignored and leaving an exception set.
+    ring = pygit2._pygit2._BlobRing(4, 128 * 1024)
+    blob_oid = testrepo.create_blob_fromworkdir('bye.txt')
+    blob = testrepo[blob_oid]
+    assert isinstance(blob, pygit2.Blob)
+    with pytest.raises(TypeError):
+        blob._write_to_ring(
+            ring,
+            as_path='bye.txt',
+            flags=BlobFilter.ATTRIBUTES_FROM_COMMIT,
+            commit_id=1234,  # type: ignore
+        )
+    # The end of the stream is signalled even on errors
+    assert read_ring(ring) == b''
+
+
+def test_blob_write_to_ring_invalid_commit_id_str(testrepo: Repository) -> None:
+    # Regression test (issue #1478): a malformed commit_id string must raise
+    # InvalidError instead of being ignored and leaving an exception set.
+    ring = pygit2._pygit2._BlobRing(4, 128 * 1024)
+    blob_oid = testrepo.create_blob_fromworkdir('bye.txt')
+    blob = testrepo[blob_oid]
+    assert isinstance(blob, pygit2.Blob)
+    with pytest.raises(pygit2.InvalidError):
+        blob._write_to_ring(
+            ring,
+            as_path='bye.txt',
+            flags=BlobFilter.ATTRIBUTES_FROM_COMMIT,
+            commit_id='not-a-valid-oid',  # type: ignore[arg-type]
+        )
+    assert read_ring(ring) == b''
 
 
 def test_blobio(testrepo: Repository) -> None:
@@ -268,46 +320,6 @@ def test_blobio_filtered(testrepo: Repository) -> None:
     assert not reader.raw._thread.is_alive()  # type: ignore[attr-defined]
 
 
-def test_blob_write_to_queue_invalid_commit_id_type(testrepo: Repository) -> None:
-    # Regression test (issue #1478): an invalid commit_id type must raise
-    # TypeError instead of being ignored and leaving an exception set.
-    queue: Queue[bytes] = Queue()
-    ready = Event()
-    done = Event()
-    blob_oid = testrepo.create_blob_fromworkdir('bye.txt')
-    blob = testrepo[blob_oid]
-    assert isinstance(blob, pygit2.Blob)
-    with pytest.raises(TypeError):
-        blob._write_to_queue(
-            queue,
-            ready,
-            done,
-            as_path='bye.txt',
-            flags=BlobFilter.ATTRIBUTES_FROM_COMMIT,
-            commit_id=1234,  # type: ignore
-        )
-
-
-def test_blob_write_to_queue_invalid_commit_id_str(testrepo: Repository) -> None:
-    # Regression test (issue #1478): a malformed commit_id string must raise
-    # InvalidError instead of being ignored and leaving an exception set.
-    queue: Queue[bytes] = Queue()
-    ready = Event()
-    done = Event()
-    blob_oid = testrepo.create_blob_fromworkdir('bye.txt')
-    blob = testrepo[blob_oid]
-    assert isinstance(blob, pygit2.Blob)
-    with pytest.raises(pygit2.InvalidError):
-        blob._write_to_queue(
-            queue,
-            ready,
-            done,
-            as_path='bye.txt',
-            flags=BlobFilter.ATTRIBUTES_FROM_COMMIT,
-            commit_id='not-a-valid-oid',  # type: ignore[arg-type]
-        )
-
-
 def test_blob_partial_read(bigrepo: Repository) -> None:
     blob_oid = bigrepo.create_blob_fromworkdir('big.txt')
     blob = bigrepo[blob_oid]
@@ -319,3 +331,61 @@ def test_blob_partial_read(bigrepo: Repository) -> None:
             break
     reader.close()
     assert not reader.raw._thread.is_alive()  # type: ignore[attr-defined]
+
+
+def run_with_timeout(fn: Callable[[], None], timeout: float = 30) -> None:
+    """Run fn in a thread; fail instead of hanging the test suite."""
+    errors: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            fn()
+        except BaseException as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), 'BlobIO hung'
+    if errors:
+        raise errors[0]
+
+
+def test_blobio_writer_error(testrepo: Repository) -> None:
+    # An error in the writer thread is raised by read() instead of hanging
+    blob_oid = testrepo.create_blob_fromworkdir('bye.txt')
+    blob = testrepo[blob_oid]
+    assert isinstance(blob, pygit2.Blob)
+
+    def read() -> None:
+        with pygit2.BlobIO(
+            blob,
+            as_path='bye.txt',
+            flags=BlobFilter.ATTRIBUTES_FROM_COMMIT,
+            commit_id='not-a-valid-oid',  # type: ignore[arg-type]
+        ) as reader:
+            with pytest.raises(pygit2.InvalidError):
+                reader.read()
+
+    run_with_timeout(read)
+
+
+def test_blobio_partial_read_stress(testrepo: Repository) -> None:
+    # Regression test: close() after a partial read used to hang now and then
+    # (lost wakeup between the reader and the writer thread)
+    data = b''.join(b'line %d\n' % i for i in range(20000))
+    blob = testrepo[testrepo.create_blob(data)]
+    assert isinstance(blob, pygit2.Blob)
+
+    def read() -> None:
+        for _ in range(500):
+            reader = pygit2.BlobIO(blob)
+            for i, line in enumerate(reader):
+                if i >= 3:
+                    break
+            reader.close()
+            assert not reader.raw._thread.is_alive()  # type: ignore[attr-defined]
+            with pygit2.BlobIO(blob) as reader:
+                assert reader.read() == data
+
+    run_with_timeout(read, timeout=120)

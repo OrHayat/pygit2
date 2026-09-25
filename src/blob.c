@@ -29,6 +29,7 @@
 #include <Python.h>
 #include <git2.h>
 #include <git2/sys/errors.h>
+#include "blobio.h"
 #include "diff.h"
 #include "error.h"
 #include "object.h"
@@ -149,125 +150,25 @@ Blob_diff_to_buffer(Blob *self, PyObject *args, PyObject *kwds)
 }
 
 
-struct blob_filter_stream {
-    git_writestream stream;
-    PyObject *py_queue;
-    PyObject *py_ready;
-    PyObject *py_closed;
-    Py_ssize_t chunk_size;
-};
-
-static int blob_filter_stream_write(
-    git_writestream *s, const char *buffer, size_t len)
-{
-    struct blob_filter_stream *stream = (struct blob_filter_stream *)s;
-    const char *pos = buffer;
-    const char *endpos = buffer + len;
-    Py_ssize_t chunk_size;
-    PyObject *result;
-    PyGILState_STATE gil = PyGILState_Ensure();
-    int err = 0;
-
-    while (pos < endpos)
-    {
-        chunk_size = endpos - pos;
-        if (stream->chunk_size < chunk_size)
-            chunk_size = stream->chunk_size;
-        result = PyObject_CallMethod(stream->py_queue, "put", "y#", pos, chunk_size);
-        if (result == NULL)
-        {
-            PyErr_Clear();
-            git_error_set(GIT_ERROR_OS, "failed to put chunk to queue");
-            err = GIT_ERROR;
-            goto done;
-        }
-        Py_DECREF(result);
-        result = PyObject_CallMethod(stream->py_ready, "set", NULL);
-        if (result == NULL)
-        {
-            PyErr_Clear();
-            git_error_set(GIT_ERROR_OS, "failed to signal queue ready");
-            err = GIT_ERROR;
-            goto done;
-        }
-        Py_DECREF(result);
-        pos += chunk_size;
-    }
-
-done:
-    PyGILState_Release(gil);
-    return err;
-}
-
-static int blob_filter_stream_close(git_writestream *s)
-{
-    struct blob_filter_stream *stream = (struct blob_filter_stream *)s;
-    PyGILState_STATE gil = PyGILState_Ensure();
-    PyObject *result = NULL;
-    int err = 0;
-
-    /* Signal closed and then ready in that order so consumers can block on
-     * ready.wait() and then check for indicated EOF (via closed.is_set()) */
-    result = PyObject_CallMethod(stream->py_closed, "set", NULL);
-    if (result == NULL)
-    {
-        PyErr_Clear();
-        git_error_set(GIT_ERROR_OS, "failed to signal writer closed");
-        err = GIT_ERROR;
-    }
-    Py_XDECREF(result);
-    result = PyObject_CallMethod(stream->py_ready, "set", NULL);
-    if (result == NULL)
-    {
-        PyErr_Clear();
-        git_error_set(GIT_ERROR_OS, "failed to signal queue ready");
-        err = GIT_ERROR;
-    }
-    Py_XDECREF(result);
-
-    PyGILState_Release(gil);
-    return err;
-}
-
-static void blob_filter_stream_free(git_writestream *s)
-{
-}
-
-
-#define STREAM_CHUNK_SIZE (8 * 1024)
-
-
-PyDoc_STRVAR(Blob__write_to_queue__doc__,
-  "_write_to_queue(queue: queue.Queue, ready: threading.Event, done: threading.Event, chunk_size: int = io.DEFAULT_BUFFER_SIZE, [as_path: str = None, flags: enums.BlobFilter = enums.BlobFilter.CHECK_FOR_BINARY, commit_id: oid = None]) -> None\n"
+PyDoc_STRVAR(Blob__write_to_ring__doc__,
+  "_write_to_ring(ring: _BlobRing, [as_path: str = None, flags: enums.BlobFilter = enums.BlobFilter.CHECK_FOR_BINARY, commit_id: oid = None]) -> None\n"
   "\n"
-  "Write the contents of the blob in chunks to `queue`.\n"
-  "If `as_path` is None, the raw contents of blob will be written to the queue,\n"
-  "otherwise the contents of the blob will be filtered.\n"
+  "Stream the contents of the blob into `ring`.\n"
+  "If `as_path` is None, the raw contents of the blob are written,\n"
+  "otherwise the contents of the blob are filtered.\n"
   "\n"
-  "In most cases, the higher level `BlobIO` wrapper should be used when\n"
-  "streaming blob content instead of calling this method directly.\n"
+  "In most cases the higher level `BlobIO` wrapper should be used instead\n"
+  "of calling this method directly.\n"
   "\n"
-  "Note that this method will block the current thread until all chunks have\n"
-  "been written to the queue. The GIL will be released while running\n"
-  "libgit2 filtering.\n"
-  "\n"
-  "Returns: The filtered content.\n"
+  "This method blocks the current thread until the whole blob has been\n"
+  "written, or until the reader closes the ring. The GIL is released while\n"
+  "libgit2 streams the blob. The end of the stream is always signalled to\n"
+  "the reader, also on errors.\n"
   "\n"
   "Parameters:\n"
   "\n"
-  "queue: queue.Queue\n"
-  "    Destination queue.\n"
-  "\n"
-  "ready: threading.Event\n"
-  "    Event to signal consumers that the data is available for reading.\n"
-  "    This event is also set upon closing the writer in order to indicate \n"
-  "    EOF.\n"
-  "\n"
-  "closed: threading.Event\n"
-  "    Event to signal consumers that the writer is closed.\n"
-  "\n"
-  "chunk_size : int\n"
-  "    Maximum size of chunks to be written to `queue`.\n"
+  "ring : _BlobRing\n"
+  "    Destination ring.\n"
   "\n"
   "as_path : str\n"
   "    When set, the blob contents will be filtered as if it had this\n"
@@ -281,37 +182,40 @@ PyDoc_STRVAR(Blob__write_to_queue__doc__,
   "    specified in `flags` (only applicable when `as_path` is set).\n");
 
 PyObject *
-Blob__write_to_queue(Blob *self, PyObject *args, PyObject *kwds)
+Blob__write_to_ring(Blob *self, PyObject *args, PyObject *kwds)
 {
-    PyObject *py_queue = NULL;
-    PyObject *py_ready = NULL;
-    PyObject *py_closed = NULL;
-    Py_ssize_t chunk_size = STREAM_CHUNK_SIZE;
+    PyObject *py_ring = NULL;
+    BlobRing *ring;
     char *as_path = NULL;
     PyObject *py_oid = NULL;
+    PyObject *result = NULL;
     int err;
-    char *keywords[] = {"queue", "ready", "closed", "chunk_size", "as_path", "flags", "commit_id", NULL};
+    char *keywords[] = {"ring", "as_path", "flags", "commit_id", NULL};
     git_blob_filter_options opts = GIT_BLOB_FILTER_OPTIONS_INIT;
     git_filter_options filter_opts = GIT_FILTER_OPTIONS_INIT;
     git_filter_list *fl = NULL;
     git_blob *blob = NULL;
     const git_oid *blob_oid;
-    struct blob_filter_stream writer;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OOO|nzIO", keywords,
-                                     &py_queue, &py_ready, &py_closed,
-                                     &chunk_size, &as_path, &opts.flags,
-                                     &py_oid))
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!|zIO", keywords,
+                                     &BlobRingType, &py_ring, &as_path,
+                                     &opts.flags, &py_oid))
         return NULL;
+    ring = (BlobRing *)py_ring;
 
-    if (Object__load((Object*)self) == NULL) { return NULL; } // Lazy load
+    /* From here on every exit goes through `done`, which signals the end of
+     * the stream so the reader never waits forever. */
+    if (Object__load((Object*)self) == NULL)  // Lazy load
+        goto done;
 
     /* we load our own copy of this blob since libgit2 objects are not
      * thread-safe */
     blob_oid = Object__id((Object*)self);
     err = git_blob_lookup(&blob, git_blob_owner(self->blob), blob_oid);
-    if (err < 0)
-        return Error_set(err);
+    if (err < 0) {
+        Error_set(err);
+        goto done;
+    }
 
     if (as_path != NULL &&
         !((opts.flags & GIT_BLOB_FILTER_CHECK_FOR_BINARY) != 0 &&
@@ -320,10 +224,8 @@ Blob__write_to_queue(Blob *self, PyObject *args, PyObject *kwds)
         if (py_oid != NULL && py_oid != Py_None)
         {
             size_t len = py_oid_to_git_oid(py_oid, &opts.attr_commit_id);
-            if (len == 0) {
-                git_blob_free(blob);
-                return NULL;
-            }
+            if (len == 0)
+                goto done;
         }
 
         if ((opts.flags & GIT_BLOB_FILTER_NO_SYSTEM_ATTRIBUTES) != 0)
@@ -337,48 +239,35 @@ Blob__write_to_queue(Blob *self, PyObject *args, PyObject *kwds)
         err = git_filter_list_load_ext(&fl, git_blob_owner(blob), blob,
                                        as_path, GIT_FILTER_TO_WORKTREE,
                                        &filter_opts);
-        if (err < 0)
-        {
-            if (blob != NULL)
-                git_blob_free(blob);
-            return Error_set(err);
+        if (err < 0) {
+            Error_set(err);
+            goto done;
         }
     }
 
-    memset(&writer, 0, sizeof(struct blob_filter_stream));
-    writer.stream.write = blob_filter_stream_write;
-    writer.stream.close = blob_filter_stream_close;
-    writer.stream.free = blob_filter_stream_free;
-    writer.py_queue = py_queue;
-    writer.py_ready = py_ready;
-    writer.py_closed = py_closed;
-    writer.chunk_size = chunk_size;
-    Py_INCREF(writer.py_queue);
-    Py_INCREF(writer.py_ready);
-    Py_INCREF(writer.py_closed);
+    BlobRing_set_size_hint(ring, (size_t)git_blob_rawsize(blob));
 
     Py_BEGIN_ALLOW_THREADS;
-    err = git_filter_list_stream_blob(fl, blob, &writer.stream);
+    err = BlobRing_stream(ring, fl, blob);
     Py_END_ALLOW_THREADS;
-    git_filter_list_free(fl);
-    if (writer.py_queue != NULL)
-        Py_DECREF(writer.py_queue);
-    if (writer.py_ready != NULL)
-        Py_DECREF(writer.py_ready);
-    if (writer.py_closed != NULL)
-        Py_DECREF(writer.py_closed);
-    if (blob != NULL)
-        git_blob_free(blob);
-    if (err < 0)
-        return Error_set(err);
 
-    Py_RETURN_NONE;
+    /* A failed write after the reader closed the ring is not an error */
+    if (err < 0 && !BlobRing_cancelled(ring))
+        Error_set(err);
+    else
+        result = Py_NewRef(Py_None);
+
+done:
+    git_filter_list_free(fl);
+    git_blob_free(blob);
+    BlobRing_finish(ring);
+    return result;
 }
 
 static PyMethodDef Blob_methods[] = {
     METHOD(Blob, diff, METH_VARARGS | METH_KEYWORDS),
     METHOD(Blob, diff_to_buffer, METH_VARARGS | METH_KEYWORDS),
-    METHOD(Blob, _write_to_queue, METH_VARARGS | METH_KEYWORDS),
+    METHOD(Blob, _write_to_ring, METH_VARARGS | METH_KEYWORDS),
     {NULL}
 };
 

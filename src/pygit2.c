@@ -35,6 +35,7 @@
 #include "utils.h"
 #include "repository.h"
 #include "oid.h"
+#include "blobio.h"
 #include "filter.h"
 
 PyObject *GitError;
@@ -508,6 +509,7 @@ PyInit__pygit2(void)
     INIT_TYPE(TreeIterType, NULL, NULL)
     INIT_TYPE(TreeBuilderType, NULL, NULL)
     INIT_TYPE(BlobType, &ObjectType, NULL)
+    INIT_TYPE(BlobRingType, NULL, PyType_GenericNew)
     INIT_TYPE(TagType, &ObjectType, NULL)
     INIT_TYPE(RefsIteratorType, NULL, NULL)
     ADD_TYPE(m, Object)
@@ -516,6 +518,9 @@ PyInit__pygit2(void)
     ADD_TYPE(m, Tree)
     ADD_TYPE(m, TreeBuilder)
     ADD_TYPE(m, Blob)
+    Py_INCREF(&BlobRingType);
+    if (PyModule_AddObject(m, "_BlobRing", (PyObject *)&BlobRingType) == -1)
+        return NULL;
     ADD_TYPE(m, Tag)
     ADD_CONSTANT_INT(m, GIT_OBJECT_ANY)
     ADD_CONSTANT_INT(m, GIT_OBJECT_INVALID)

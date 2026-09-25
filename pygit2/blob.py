@@ -1,20 +1,24 @@
 import io
 import threading
-import time
 from contextlib import AbstractContextManager
-from queue import Queue
 from typing import Optional
 
-from ._pygit2 import Blob, Oid
+from ._pygit2 import Blob, Oid, _BlobRing
 from .enums import BlobFilter
+
+# libgit2's output is batched into slots of RING_SLOT_SIZE bytes; the ring holds
+# up to RING_SLOTS of them. Slots are allocated lazily and the first one is
+# sized from the blob, so small blobs use little memory.
+RING_SLOTS = 4
+RING_SLOT_SIZE = 128 * 1024
 
 
 class _BlobIO(io.RawIOBase):
     """Low-level wrapper for streaming blob content.
 
-    The underlying libgit2 git_writestream filter chain will be run
-    in a separate thread. The GIL will be released while running
-    libgit2 filtering.
+    The underlying libgit2 git_writestream filter chain runs in a separate
+    thread and writes into a _BlobRing, with the GIL released. Closing
+    before the end stops libgit2 instead of streaming the rest.
     """
 
     def __init__(
@@ -26,21 +30,29 @@ class _BlobIO(io.RawIOBase):
     ):
         super().__init__()
         self._blob = blob
-        self._queue: Optional[Queue] = Queue(maxsize=1)
-        self._ready = threading.Event()
-        self._writer_closed = threading.Event()
-        self._chunk: Optional[bytes] = None
+        self._ring = _BlobRing(RING_SLOTS, RING_SLOT_SIZE)
+        self._error: Optional[BaseException] = None
         self._thread = threading.Thread(
-            target=self._blob._write_to_queue,
-            args=(self._queue, self._ready, self._writer_closed),
-            kwargs={
-                'as_path': as_path,
-                'flags': int(flags),
-                'commit_id': commit_id,
-            },
+            target=self._write,
+            args=(as_path, int(flags), commit_id),
             daemon=True,
         )
         self._thread.start()
+
+    def _write(
+        self, as_path: Optional[str], flags: int, commit_id: Optional[Oid]
+    ) -> None:
+        try:
+            self._blob._write_to_ring(
+                self._ring, as_path=as_path, flags=flags, commit_id=commit_id
+            )
+        except BaseException as e:
+            # Raised by readinto(); otherwise the reader would just see EOF
+            self._error = e
+        finally:
+            # _write_to_ring signals the end itself; this also covers errors
+            # raised before it got that far
+            self._ring.close_write()
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
@@ -59,51 +71,23 @@ class _BlobIO(io.RawIOBase):
 
     def readinto(self, b, /):
         try:
-            while self._chunk is None:
-                self._ready.wait()
-                if self._queue.empty():
-                    if self._writer_closed.is_set():
-                        # EOF
-                        return 0
-                    self._ready.clear()
-                    time.sleep(0)
-                    continue
-                chunk = self._queue.get()
-                if chunk:
-                    self._chunk = chunk
-
-            if len(self._chunk) <= len(b):
-                bytes_written = len(self._chunk)
-                b[:bytes_written] = self._chunk
-                self._chunk = None
-                return bytes_written
-            bytes_written = len(b)
-            b[:] = self._chunk[:bytes_written]
-            self._chunk = self._chunk[bytes_written:]
-            return bytes_written
+            n = self._ring.readinto(b)
         except KeyboardInterrupt:
             return 0
+        if n == 0 and self._error is not None:
+            error, self._error = self._error, None
+            raise error
+        return n
 
     def close(self) -> None:
+        if self.closed:
+            return
         try:
-            # The writer thread may be blocked in queue.put() because the
-            # queue (maxsize=1) still holds a chunk that was never consumed
-            # (e.g. the reader stopped before reaching EOF). Draining the
-            # queue must happen *before* (not after) waiting for
-            # `_writer_closed`, otherwise the writer can never make progress
-            # to reach its close callback and this would deadlock.
-            while True:
-                self._ready.wait()
-                while self._queue is not None and not self._queue.empty():
-                    self._queue.get()
-                if self._writer_closed.is_set():
-                    # Done
-                    break
-                self._ready.clear()
+            self._ring.close()
             self._thread.join()
         except KeyboardInterrupt:
             pass
-        self._queue = None
+        super().close()
 
 
 class BlobIO(io.BufferedReader, AbstractContextManager):

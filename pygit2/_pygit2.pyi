@@ -1,8 +1,6 @@
 from collections.abc import Iterator, Sequence
-from io import DEFAULT_BUFFER_SIZE, IOBase
+from io import IOBase
 from pathlib import Path
-from queue import Queue
-from threading import Event
 from typing import (  # noqa: UP035
     Generic,
     Literal,
@@ -14,7 +12,7 @@ from typing import (  # noqa: UP035
     overload,
 )
 
-from typing_extensions import disjoint_base
+from typing_extensions import Buffer, disjoint_base
 
 from . import Index
 from ._libgit2.ffi import (
@@ -337,6 +335,14 @@ class AuthError(GitError): ...
 class InvalidError(GitError, ValueError): ...
 
 @final
+class _BlobRing:
+    def __init__(self, slots: int, slot_size: int, size_hint: int = 0) -> None: ...
+    def readinto(self, buffer: Buffer, /) -> int: ...
+    def close(self) -> None: ...
+    def close_write(self) -> None: ...
+    def allocated(self) -> int: ...
+
+@final
 class Blob(Object):
     data: bytes
     is_binary: bool
@@ -355,14 +361,11 @@ class Blob(Object):
         old_as_path: str = ...,
         buffer_as_path: str = ...,
     ) -> Patch: ...
-    def _write_to_queue(
+    def _write_to_ring(
         self,
-        queue: Queue[bytes],
-        ready: Event,
-        done: Event,
-        chunk_size: int = DEFAULT_BUFFER_SIZE,
+        ring: _BlobRing,
         as_path: Optional[str] = None,
-        flags: BlobFilter = BlobFilter.CHECK_FOR_BINARY,
+        flags: BlobFilter | int = BlobFilter.CHECK_FOR_BINARY,
         commit_id: Optional[Oid] = None,
     ) -> None: ...
     def __buffer__(self, flags: int, /) -> memoryview: ...
